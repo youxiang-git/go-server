@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/youxiang-git/go-server/internal/auth"
 	"github.com/youxiang-git/go-server/internal/database"
 )
 
@@ -22,6 +23,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	DB             *database.Queries
 	platform       string
+	jwtSecret      string
 }
 
 type User struct {
@@ -44,7 +46,10 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 	const rootDir = "."
 	const port = "8080"
-	apiConfig := &apiConfig{}
+	apiConfig := &apiConfig{
+
+		jwtSecret: os.Getenv("JWT_SECRET"),
+	}
 
 	db, err := sql.Open("postgres", dbURL)
 
@@ -65,10 +70,14 @@ func main() {
 
 	mux.Handle("/app/", apiConfig.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(rootDir)))))
 	mux.HandleFunc("GET /admin/metrics", apiConfig.handlerMetrics)
-	mux.HandleFunc("POST /admin/reset", apiConfig.handlerMetricsReset)
 	mux.HandleFunc("GET /api/healthz", handlerReadiness)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiConfig.handlerGetChirpByID)
+	mux.HandleFunc("GET /api/chirps", apiConfig.handlerGetAllChirps)
+	mux.HandleFunc("POST /admin/reset", apiConfig.handlerMetricsReset)
 	mux.HandleFunc("POST /api/users", apiConfig.handlerPostUser)
 	mux.HandleFunc("POST /api/chirps", apiConfig.handlerPostChirp)
+	mux.HandleFunc("POST /api/login", apiConfig.handlerLogin)
+	mux.HandleFunc("PUT /api/users", apiConfig.handlerPutUser)
 
 	log.Printf("Serving on port: %s\n", port)
 	log.Fatal(srv.ListenAndServe())
@@ -85,10 +94,10 @@ func (cfg *apiConfig) handlerMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<html>
 	<body>
-		<h1>Welcome, Chirpy Admin</h1>
-		<p>Chirpy has been visited %d times!</p>
+	<h1>Welcome, Chirpy Admin</h1>
+	<p>Chirpy has been visited %d times!</p>
 	</body>
-</html>`, hitCount)
+	</html>`, hitCount)
 }
 
 func (cfg *apiConfig) handlerMetricsReset(w http.ResponseWriter, r *http.Request) {
@@ -108,6 +117,52 @@ func (cfg *apiConfig) handlerMetricsReset(w http.ResponseWriter, r *http.Request
 	respondWithJSON(w, http.StatusOK, map[string]string{"message": "All users deleted"})
 }
 
+func (cfg *apiConfig) handlerGetAllChirps(w http.ResponseWriter, r *http.Request) {
+	items, err := cfg.DB.GetAllChirps(r.Context())
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to retrieve users", err)
+		return
+	}
+
+	returnChirps := []Chirp{}
+
+	for _, item := range items {
+		returnChirps = append(returnChirps, convertDatabaseChirp(item))
+	}
+
+	respondWithJSON(w, http.StatusOK, returnChirps)
+}
+
+func convertDatabaseChirp(dbChirp database.Chirp) Chirp {
+	return Chirp{
+		ID:        dbChirp.ID,
+		CreatedAt: dbChirp.CreatedAt,
+		UpdatedAt: dbChirp.UpdatedAt,
+		Body:      dbChirp.Body,
+		UserID:    dbChirp.UserID,
+	}
+}
+
+func (cfg *apiConfig) handlerGetChirpByID(w http.ResponseWriter, r *http.Request) {
+	pathVal := r.PathValue("chirpID")
+
+	chirp_id, err := uuid.Parse(pathVal)
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to parse uuid", err)
+	}
+
+	chirp, err := cfg.DB.GetChirpById(r.Context(), chirp_id)
+
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "Unable to find chirp associated with id", err)
+	}
+
+	respondWithJSON(w, http.StatusOK, convertDatabaseChirp(chirp))
+
+}
+
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg.fileserverHits.Add(1)
@@ -119,7 +174,8 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 
 func (cfg *apiConfig) handlerPostUser(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Email string `json:"email"`
+		Password string `json:"password"`
+		Email    string `json:"email"`
 	}
 	type response struct {
 		User
@@ -134,7 +190,17 @@ func (cfg *apiConfig) handlerPostUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := cfg.DB.CreateUser(r.Context(), params.Email)
+	params.Password, err = auth.HashPassword(params.Password)
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not hash password", err)
+		return
+	}
+
+	user, err := cfg.DB.CreateUser(r.Context(), database.CreateUserParams{
+		HashedPassword: params.Password,
+		Email:          params.Email,
+	})
 
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't create user", err)
@@ -150,15 +216,89 @@ func (cfg *apiConfig) handlerPostUser(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+	type response struct {
+		User
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters", err)
+		return
+	}
+
+	user, err := cfg.DB.GetUserByEmail(r.Context(), params.Email)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password", err)
+		return
+	}
+
+	err = auth.CheckPasswordHash(params.Password, user.HashedPassword)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password", err)
+		return
+	}
+
+	refresh_token, err := auth.MakeRefreshToken()
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to generate refresh token", err)
+	}
+
+	expirationTime := time.Hour
+
+	if params.ExpiresInSeconds != nil {
+		requestedTime := time.Duration(*params.ExpiresInSeconds) * time.Second
+		if requestedTime < time.Hour {
+			expirationTime = requestedTime
+		}
+	}
+
+	token, err := auth.MakeJWT(user.ID, cfg.jwtSecret, expirationTime)
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create token", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"id":         user.ID,
+		"email":      user.Email,
+		"token":      token,
+		"created_at": user.CreatedAt,
+		"updated_at": user.UpdatedAt,
+	})
+}
+
 func (cfg *apiConfig) handlerPostChirp(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
 		Body   string    `json:"body"`
 		UserID uuid.UUID `json:"user_id"`
 	}
 
+	token, err := auth.GetBearerToken(r.Header)
+
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Missing or invalid token", err)
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid token", err)
+		return
+	}
+
 	decoder := json.NewDecoder(r.Body)
 	params := parameters{}
-	err := decoder.Decode(&params)
+	err = decoder.Decode(&params)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters", err)
 		return
@@ -172,7 +312,7 @@ func (cfg *apiConfig) handlerPostChirp(w http.ResponseWriter, r *http.Request) {
 
 	chirp, err := cfg.DB.CreateChirp(r.Context(), database.CreateChirpParams{
 		Body:   cleaned,
-		UserID: params.UserID,
+		UserID: userID,
 	})
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't create chirp", err)
@@ -186,6 +326,56 @@ func (cfg *apiConfig) handlerPostChirp(w http.ResponseWriter, r *http.Request) {
 		Body:      chirp.Body,
 		UserID:    chirp.UserID,
 	})
+}
+
+func (cfg *apiConfig) handlerPutUser(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+
+	token, err := auth.GetBearerToken(r.Header)
+
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Missing or invalid token", err)
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid token", err)
+		return
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err = decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't decode parameters", err)
+		return
+	}
+
+	hashed_pw, err := auth.HashPassword(params.Password)
+
+	updatedUser, err := cfg.DB.UpdateUser(r.Context(), database.UpdateUserParams{
+		Email:          params.Email,
+		ID:             userID,
+		HashedPassword: hashed_pw,
+	})
+
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Missing or invalid token", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, User{
+		ID:        updatedUser.ID,
+		CreatedAt: updatedUser.CreatedAt,
+		UpdatedAt: updatedUser.UpdatedAt,
+		Email:     updatedUser.Email,
+	})
+
 }
 
 func validateChirp(body string) (string, error) {
