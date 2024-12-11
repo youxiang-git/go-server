@@ -221,9 +221,6 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 		Email    string `json:"email"`
 	}
-	type response struct {
-		User
-	}
 
 	decoder := json.NewDecoder(r.Body)
 	params := parameters{}
@@ -245,25 +242,29 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	expirationTime := time.Hour
+
+	token, err := auth.MakeJWT(user.ID, cfg.jwtSecret, expirationTime)
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create token", err)
+		return
+	}
+
 	refresh_token, err := auth.MakeRefreshToken()
 
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to generate refresh token", err)
 	}
 
-	expirationTime := time.Hour
-
-	if params.ExpiresInSeconds != nil {
-		requestedTime := time.Duration(*params.ExpiresInSeconds) * time.Second
-		if requestedTime < time.Hour {
-			expirationTime = requestedTime
-		}
-	}
-
-	token, err := auth.MakeJWT(user.ID, cfg.jwtSecret, expirationTime)
+	_, err = cfg.DB.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+		Token:     refresh_token,
+		UserID:    user.ID,
+		ExpiresAt: time.Now().UTC().Add(time.Hour * 24 * 60),
+	})
 
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't create token", err)
+		respondWithError(w, http.StatusInternalServerError, "Unable to save refresh token", err)
 		return
 	}
 
@@ -357,6 +358,11 @@ func (cfg *apiConfig) handlerPutUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hashed_pw, err := auth.HashPassword(params.Password)
+
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Unable to hash password", err)
+		return
+	}
 
 	updatedUser, err := cfg.DB.UpdateUser(r.Context(), database.UpdateUserParams{
 		Email:          params.Email,
